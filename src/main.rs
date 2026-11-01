@@ -2,9 +2,7 @@ use chromiumoxide::cdp::browser_protocol::network::{SetCookieParams, TimeSinceEp
 use chromiumoxide::{Browser, BrowserConfig, Page};
 use futures::StreamExt;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use tokio::sync::{Mutex, Semaphore, mpsc};
-use tokio::task::JoinSet;
-use tokio::time::sleep;
+use tokio::sync::{Mutex, mpsc};
 use std::collections::HashSet;
 use std::env;
 use std::fs::{self, File, OpenOptions};
@@ -365,12 +363,7 @@ async fn download_single_video(
             .unwrap(),
     );
     
-    let display_title = if output_path.len() > 50 {
-        format!("{}...", &output_path[..47])
-    } else {
-        output_path.to_string()
-    };
-
+    let display_title = output_path.to_string();
     pb.set_message(format!("Starting: {}", display_title));
 
     // 2. Run yt-dlp writing into temp folder and extracting subtitles simultaneously
@@ -617,11 +610,11 @@ async fn create_jellyfin_hardlinks() -> Result<(), Box<dyn std::error::Error>> {
 
         let program_dir = format!("./videos/{}", program_folder_name);
 
-        // 3. Process videos and create hardlinks
+        // 3. Process videos, hardlink video files, subtitles, and thumbnails
         for (index, video) in record.videos.iter().enumerate() {
             let episode_num = index + 1;
             let sanitized_title = sanitize_filename(&video.title);
-            let structured_filename = format!("{} - S01E{:02}.mp4", sanitized_title, episode_num);
+            let structured_filename = format!("{} - S01E{:0>2}.mp4", sanitized_title, episode_num);
 
             let original_path = format!("{}/{:0>2}_{}.mp4", program_dir, episode_num, sanitized_title);
             let target_video_path = format!("{}/{}", season_dest_dir, structured_filename);
@@ -632,14 +625,14 @@ async fn create_jellyfin_hardlinks() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             
-            // Create hardlink (remove existing target link first if it exists)
+            // Create hardlink for video (remove existing target link first if it exists)
             if Path::new(&target_video_path).exists() {
                 let _ = std::fs::remove_file(&target_video_path);
             }
 
             match std::fs::hard_link(&original_path, &target_video_path) {
-                Ok(_) => println!("✔ Hardlinked: {} -> {}", original_path, target_video_path),
-                Err(e) => eprintln!("✖ Failed to hardlink {}: {}", video.title, e),
+                Ok(_) => println!("✔ Hardlinked video: {}", structured_filename),
+                Err(e) => eprintln!("✖ Failed to hardlink video {}: {}", video.title, e),
             }
 
             // 4. Write episode .nfo file in the structured path
@@ -662,11 +655,60 @@ async fn create_jellyfin_hardlinks() -> Result<(), Box<dyn std::error::Error>> {
             );
             std::fs::write(target_nfo_path, episode_xml)?;
 
-            // 5. If subtitle files exist for the original, hardlink them too!
+            // 5. If subtitle files exist for the original, hardlink them too
             link_subtitles_if_exist(&original_path, &target_video_path);
-        }
-    }
 
+            // 6. If a thumbnail (.jpg) exists for the original, hardlink it as well
+            let orig_thumb_path = Path::new(&original_path).with_extension("jpg");
+            if orig_thumb_path.exists() {
+                let target_thumb_path = Path::new(&target_video_path).with_extension("jpg");
+                if target_thumb_path.exists() {
+                    let _ = std::fs::remove_file(&target_thumb_path);
+                }
+                if let (Some(orig_str), Some(target_str)) = (orig_thumb_path.to_str(), target_thumb_path.to_str()) {
+                    if let Ok(_) = std::fs::hard_link(orig_str, target_str) {
+                        // Optional: quiet success or log if needed
+                    }
+                }
+            }
+        }
+
+        if record.videos.is_empty() {
+            continue;
+        }
+
+        let last_index = record.videos.len() -1;
+        let second_last_index = if record.videos.len() > 1 { record.videos.len() -2 } else {0}; 
+
+        let last_episode_original_thumb = format!("{}/{:0>2}_{}.jpg", program_dir, last_index + 1, 
+            sanitize_filename(&record.videos[last_index].title));
+
+
+        let second_last_episode_original_thumb = format!("{}/{:0>2}_{}.jpg", program_dir, second_last_index + 1, 
+            sanitize_filename(&record.videos[second_last_index].title));
+
+        if Path::new(&last_episode_original_thumb).exists() {
+            let show_poster_path = format!("{}/poster.jpg", program_dest_dir);
+
+            if Path::new(&show_poster_path).exists() {
+                 let _ = std::fs::remove_file(&show_poster_path);
+            }
+
+            let _ = std::fs::copy(&last_episode_original_thumb, &show_poster_path);
+        }
+
+        if Path::new(&second_last_episode_original_thumb).exists() {
+            let season_poster_path = format!("{}/poster.jpg", season_dest_dir);
+            if Path::new(&season_poster_path).exists() {
+                 let _ = std::fs::remove_file(&season_poster_path);
+            }
+
+            let _ = std::fs::copy(&second_last_episode_original_thumb, &season_poster_path);
+
+        }
+
+    }
+    
     println!("\nJellyfin hardlink library successfully built at '{}'!", jellyfin_root);
     Ok(())
 }
@@ -694,6 +736,89 @@ fn link_subtitles_if_exist(original_video: &str, target_video: &str) {
             }
         }
     }
+}
+
+
+async fn create_thumbnails() -> Result<(), Box<dyn std::error::Error>> {
+    let file = File::open("programs_records.jsonl")?;
+    let reader = BufReader::new(file);
+
+    for line in reader.lines() {
+        let line_str = line?;
+        if line_str.trim().is_empty() {
+            continue;
+        }
+
+        let record: ProgramRecord = serde_json::from_str(&line_str)?;
+        let program_folder_name = sanitize_filename(&record.title);
+        let program_dir = format!("./videos/{}", program_folder_name);
+
+        for (index, video) in record.videos.iter().enumerate() {
+            let episode_num = index + 1;
+            let sanitized_title = sanitize_filename(&video.title);
+            let original_path = format!("{}/{:0>2}_{}.mp4", program_dir, episode_num, sanitized_title);
+            extract_video_thumbnail(&original_path).await?; 
+        }
+    }
+
+    Ok(())
+}
+
+
+
+async fn extract_video_thumbnail(video_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let path = Path::new(video_path);
+    if !path.exists() {
+        return Err("Video file does not exist".into());
+    }
+
+    // 1. Automatically replaces .mp4 with .jpg (e.g., video.mp4 -> video.jpg)
+    let thumb_path = path.with_extension("jpg");
+    let thumb_path_str = thumb_path.to_str().ok_or("Invalid thumbnail path")?;
+
+    if Path::new(thumb_path_str).exists() {
+        return Ok(());
+    }
+
+    // 2. Get video duration using ffprobe asynchronously
+    let probe_output = Command::new("ffprobe")
+        .args(&[
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            video_path,
+        ])
+        .output()
+        .await?;
+
+    let duration_str = String::from_utf8(probe_output.stdout)?;
+    let duration: f64 = duration_str.trim().parse().unwrap_or(10.0);
+    
+    // Seek to the middle of the video
+    let seek_time = if duration > 10.0 { duration / 2.0 } else { 2.0 };
+
+    // 3. Extract frame using ffmpeg asynchronously
+    let status = Command::new("ffmpeg")
+        .args(&[
+            "-y",
+            "-ss", &seek_time.to_string(),
+            "-i", video_path,
+            "-vframes", "1",
+            "-q:v", "2",
+            thumb_path_str,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await?;
+
+    if status.success() {
+        if let Some(file_name) = path.file_name() {
+            println!("✔ Extracted thumbnail for: {}", file_name.to_string_lossy());
+        }
+    }
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -751,6 +876,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         "jellyfin" => {
             create_jellyfin_hardlinks().await?;
+        }
+        "thumbnails" => {
+            create_thumbnails().await?;
         }
         _ => {
             eprintln!(
