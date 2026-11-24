@@ -2,7 +2,7 @@ use chromiumoxide::{Browser, BrowserConfig};
 use futures::StreamExt;
 use std::env;
 
-use crate::{common::load_cookies, courses::{fetch_courses, print_pending_videos, scrape_videos}, harness_guides::scrape_harness_guides, items::fetch_items, jellyfin::{create_jellyfin_hardlinks, create_thumbnails}};
+use crate::{blog::scrape_blogs, common::load_cookies, courses::{fetch_courses, print_pending_videos, scrape_videos}, harness_guides::scrape_harness_guides, items::fetch_items, jellyfin::{create_jellyfin_hardlinks, create_thumbnails}};
 
 pub mod common;
 pub mod items;
@@ -10,6 +10,7 @@ pub mod old_programms;
 pub mod courses;
 pub mod harness_guides;
 pub mod jellyfin;
+pub mod blog;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -24,7 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Commands that require launching the browser instance
     match command.as_str() {
-        "fetch-items" | "fetch-courses" | "scrape-harness-guides" | "scrape-videos" => {
+        "fetch-items" | "fetch-courses" | "scrape-harness-guides" | "scrape-videos" | "scrape-blogs" => {
             println!("Launching browser for task: '{}'...", command);
             
             let (browser, mut handler) = Browser::launch(
@@ -54,7 +55,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         3
                     };
                     scrape_videos(&page, concurrency_limit).await?;
-                }                _ => unreachable!(),
+                }               
+                "scrape-blogs" => { scrape_blogs(&page).await?; }
+                _ => unreachable!(),
             }
         }
         "scrape-videos-dry-run" => {
